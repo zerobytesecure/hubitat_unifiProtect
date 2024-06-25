@@ -1,0 +1,861 @@
+/*
+
+Copyright 2020 - tomw
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+-------------------------------------------
+
+Change history:
+
+1.4.4 - tomw - Support chimes and viewports
+1.4.3 - tomw - Bugfixes
+1.4.1 - tomw - Performance improvements to reduce hub load
+1.3.7 - tomw - Support G4 Doorbell Pro
+1.3.6 - tomw - Improved event handling
+1.3.5 - tomw - Bugfix for non-deflated event packets (exposed by controller version 2.1.1-beta.3)
+1.3.4 - tomw - Added light support and "isDark" attribute on cameras and lights
+1.3.3 - tomw - Bugfix in login flow
+1.3.1 - tomw - Hide unused server.py preferences for IP/port
+1.3.0 - tomw - Local processing for events.  No server.py required with Hubitat 2.2.8.143 and later
+1.2.4 - tomw - Improved recovery behavior when Initialize fails.  Reduced State storage usage.
+1.2.3 - tomw - Bugfixes for websocket error handling
+1.2.2 - tomw - Improvements for websocket uptime
+1.2.0 - tomw - Added doorbell LCD message support
+1.1.0 - tomw - Added Smart Detect support (for supported cameras only, must be configured in UniFi Protect controller)
+1.0.0 - tomw - Initial release
+
+*/
+
+metadata
+{
+    definition(name: "UniFi Protect Controller", namespace: "tomw", author: "tomw", importUrl: "")
+    {
+        capability "Initialize"
+        capability "Refresh"
+        
+        command "createChildDevices"
+        command "deleteChildDevices"
+        
+        attribute "commStatus", "string"
+    }
+}
+
+preferences
+{
+    section
+    {
+        input "controllerIP", "text", title: "UniFi controller IP", required: true
+    }
+    section
+    {
+        input "username", "text", title: "Username", required: true
+        input "password", "password", title: "Password", required: true
+    }
+    section
+    {
+        input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
+        input name: "disablePreFiltering", type: "bool", title: "Disable event pre-filtering<br>(not recommended, will consume more hub CPU)", defaultValue: false
+    }
+}
+
+def logDebug(msg) 
+{
+    if (logEnable)
+    {
+        log.debug(msg)
+    }
+}
+
+def updated()
+{
+    initialize()
+}
+
+def initialize()
+{
+    sendEvent(name: "commStatus", value: "unknown")
+    try
+    {
+        unschedule()
+        closeEventSocket()
+        
+        refreshCookie()
+        refresh()
+
+        runIn(5, openEventSocket)
+        
+        sendEvent(name: "commStatus", value: "good")
+    }
+    catch (Exception e)
+    {
+        logDebug("initialize() failed: ${e.message}")
+        sendEvent(name: "commStatus", value: "error")
+        
+        reinitialize()
+    }
+}
+
+def refresh()
+{
+    def bs = readBootstrap()
+    if(!bs) { return }
+    
+    
+    // update child devices with current states
+    def devsToRefresh =
+        [ bs.cameras, bs.chimes, bs.lights, bs.viewers ]
+    
+    devsToRefresh.each
+    {
+        it?.each { processEvents(it.id, it) }
+    }
+}
+
+def genParamsAuth()
+{
+    def params =
+        [
+            uri: getBaseURI() + getLoginSuffix(),
+            headers:
+            [
+                'X-CSRF-Token': getCsrf()
+            ],
+            
+            contentType: "application/json",
+            requestContentType: "application/json",
+            body: "{\"username\": \"${username}\", \"password\": \"${password}\"}",
+            ignoreSSLIssues: true
+        ]
+ 
+    return params
+}
+
+def genParamsMain(suffix, body = null)
+{
+    def params =
+        [
+            uri: getBaseURI() + suffix,
+            headers:
+            [
+                'Cookie': getCookie(),
+                'X-CSRF-Token': getCsrf()
+            ],
+            ignoreSSLIssues: true,
+        ]
+    
+    if(body)
+    {
+        params['body'] = body
+        params['contentType'] = 'application/json'
+        params['requestContentType'] = 'application/json'
+    }
+ 
+    return params
+}
+
+def genHeadersWss()
+{
+    def headers =
+        [
+            'Cookie': getCookie()
+        ]
+    
+    return headers
+}
+
+def getBaseURI()
+{
+    return "https://${controllerIP}"
+}
+
+def getLoginSuffix()
+{
+    return "/api/auth/login"
+}
+
+def getBootstrapSuffix()
+{
+    return "/proxy/protect/api/bootstrap"
+}
+
+def getWssURI(id)
+{
+    return "wss://${controllerIP}" + "/proxy/protect/ws/updates?" + "lastUpdateId=${id}";
+}
+
+def login()
+{
+    def resp = httpExec("POST", genParamsAuth())
+    //logDebug("login = ${resp.data}")
+    
+    updateAuthTokensStore(resp)
+}
+
+def updateAuthTokensStore(resp)
+{
+    if(resp)
+    {
+        resp?.getHeaders()?.each
+        {
+            //logDebug("header: ${it.getName()} == ${it.getValue()}")
+            
+            if(it.getName()?.toString() == "X-CSRF-Token")
+            {
+                setCsrf(it.getValue())
+            }
+            
+            if(it.getName()?.toString() == "Set-Cookie")
+            {
+                setCookie(it.getValue()?.split(';')[0])
+                
+                // extract the expiration time from the cookie
+                def rawToken = it.getValue()?.split('=')[1]
+                
+                //setExpir(new groovy.json.JsonSlurper().parseText(new String(rawToken?.tokenize(".")?.getAt(1)?.decodeBase64()))?.exp)
+                // Use `iat` instead, because some newer UniFi OS JWT reponses don't seen to have `exp`.
+                //  Assumption is that the token is valid for 60 minutes.
+                setExpir(new groovy.json.JsonSlurper().parseText(new String(rawToken?.tokenize(".")?.getAt(1)?.decodeBase64()))?.iat + (60 * 60))
+                
+                // schedule next refreshCookie 10 minutes before expiration
+                def now = ((new Date().getTime()) / 1000).toInteger()
+                runIn((getExpir() - now) - (60 * 10), reinitialize)
+            }
+        }
+    }
+}
+
+def refreshCookie()
+{
+    sendEvent(name: "commStatus", value: "unknown")
+    
+    try
+    {
+        login()
+        
+        sendEvent(name: "commStatus", value: "good")
+    }
+    catch (Exception e)
+    {
+        logDebug("refreshCookie() failed: ${e.message}")
+        sendEvent(name: "commStatus", value: "error")
+        
+        throw(e)
+    }
+}
+
+def manageChildDevice(it)
+{
+    if(!it) { return }
+    
+    if((it.name && it.id) && !findChildDevice(it.id, it.typeName))
+    {
+        createChildDevice(it.name, it.id, it.typeName)
+    }
+    
+    if((it.name && it.id) && !findChildDevice(it.id, "doorbell") && 
+       (it.featureFlags?.isDoorbell || it.type?.toLowerCase()?.contains("doorbell")))
+    {
+        // special case to create additional device for doorbells
+        createChildDevice(it.name, it.id, "doorbell")
+    }
+}
+
+def createChildDevices()
+{
+    def bs = getBootstrap()
+    
+    // check for and create child devices for supported types
+    bs?.cameras?.each { manageChildDevice(it) }    
+    bs?.chimes?.each { manageChildDevice(it) }    
+    bs?.lights?.each { manageChildDevice(it) }    
+    bs?.viewers?.each { manageChildDevice(it) }
+    
+    // get initial states for all devices
+    refresh()
+}
+
+def deleteChildDevices()
+{
+    for(child in getChildDevices())
+    {
+        deleteChildDevice(child.deviceNetworkId)
+    }
+}
+
+def webSocketStatus(String message)
+{
+    logDebug("webSocketStatus: ${message}")
+    
+    // thanks for the idea: https://community.hubitat.com/t/websocket-client/11843/15
+    if(message.startsWith("status: open"))
+    {        
+        sendEvent(name: "commStatus", value: "good")
+        
+        state.reconnectDelay = 1
+        setWasExpectedClose(false)
+        
+        return
+    }
+    else if(message.startsWith("status: closing"))
+    {
+        sendEvent(name: "commStatus", value: "no events")
+        if(getWasExpectedClose())
+        {
+            setWasExpectedClose(false)
+            return
+        }
+        
+        reinitialize()
+        
+        return
+    }
+    else if(message.startsWith("failure:"))
+    {
+        sendEvent(name: "commStatus", value: "error")        
+        reinitialize()
+        
+        return
+    }
+}
+
+def reinitialize()
+{
+    // thanks @ogiewon for the example
+    
+    // first delay is 2 seconds, doubles every time
+    def delayCalc = (state.reconnectDelay ?: 1) * 2    
+    // upper limit is 600s
+    def reconnectDelay = delayCalc <= 600 ? delayCalc : 600
+    
+    state.reconnectDelay = reconnectDelay
+    runIn(reconnectDelay, initialize)
+}
+
+def openEventSocket()
+{
+    try
+    {
+        //logDebug("interfaces.webSocket.connect(${getWssURI(getBootstrap()?.lastUpdateId)}, headers: ${genHeadersWss()}, ignoreSSLIssues: true, perMessageDeflate: false)")
+        interfaces.webSocket.connect(getWssURI(getBootstrap()?.lastUpdateId), headers: genHeadersWss(), ignoreSSLIssues: true, perMessageDeflate: false)
+    }
+    catch (Exception e)
+    {
+        logDebug("error: ${e.message}")
+        sendEvent(name: "commStatus", value: "error")
+    }
+}
+
+def closeEventSocket()
+{
+    try
+    {
+        setWasExpectedClose(true)
+        // wait for state to catch up
+        pauseExecution(500)
+        
+        interfaces.webSocket.close()
+    }
+    catch (Exception e)
+    {
+        // swallow errors
+    }
+}
+
+def parse(String message)
+{
+    //logDebug("parse: ${message}")    
+    def packet = packetValidateAndDecode(message)
+    
+    if(packet)
+    {
+        if(
+            ["camera", "chime", "light", "viewer"].contains(packet.actionPacket?.actionPayload?.modelKey?.toString()) &&
+            packet.actionPacket?.actionPayload?.action?.toString() == "update"
+            )
+        {
+            // process standard events on child devices            
+            processEvents(packet.actionPacket.actionPayload.id, packet.dataPacket?.dataPayload)
+        }
+        
+        if(
+            packet.actionPacket?.actionPayload?.modelKey?.toString() == "event" &&
+            packet.actionPacket?.actionPayload?.action?.toString() == "add"
+            )
+        {
+            // this is likely a Smart Detect event
+            processEvents(packet.dataPacket?.dataPayload?.camera, packet.dataPacket?.dataPayload)
+        }
+    }
+}
+
+def processEvents(id, event)
+{
+    childTypeTranslation()?.keySet()?.each
+    {
+        findChildDevice(id, it)?.processEvent(event)
+    }
+}
+
+def childName(name, deviceType)
+{
+    return "${name.toString()}-${deviceType.toString()}"
+}
+
+def childDni(id, deviceType)
+{
+    return "${id.toString()}-${deviceType.toString()}"
+}
+
+def findChildDevice(id, deviceType)
+{
+    return getChildDevice(childDni(id, deviceType))
+}
+
+def childTypeTranslation()
+{
+    // this translates the deviceType attribute I injected into bootstrap into the names of
+    //   the drivers (plus 'doorbell' as a special extension for cameras)
+    return [ chime: "Chime", doorbell: "Doorbell", light: "Light",
+          motion: "Camera", viewer: "Viewer" ]
+}
+
+def createChildDevice(name, id, deviceType)
+{
+    // translate the metadata from getBootstrap() to what the driver names actually are
+    def typeAlias = childTypeTranslation()?.getAt(deviceType)
+    
+    def child
+    try
+    {
+        if(!typeAlias) { throw new Exception("Unknown device type: ${deviceType}") }
+        
+        addChildDevice("UniFi Protect " + typeAlias, childDni(id, deviceType), [name: childName(name, deviceType), label: childName(name, deviceType), isComponent: false])
+    }
+    catch(com.hubitat.app.exception.UnknownDeviceTypeException e)
+    {
+        log.info "Couldn't create device for ${name}.  Check to make sure this driver is installed: UniFi Protect ${typeAlias}"
+    }
+    catch (Exception e)
+    {
+        logDebug("createChildDevice() failed: ${e.message}")
+    }
+}
+
+def setCookie(cookie)
+{
+    state.cookie = cookie
+}
+
+def getCookie()
+{
+    return state.cookie
+}
+
+def setExpir(expir)
+{
+    state.expir = expir
+}
+
+def getExpir()
+{
+    return state.expir
+}
+
+def setCsrf(csrf)
+{
+    state.csrf = csrf
+}
+
+def getCsrf()
+{
+    return state.csrf
+}
+
+def setWasExpectedClose(wasExpected)
+{
+    state.wasExpectedClose = wasExpected
+}
+
+def getWasExpectedClose()
+{
+    return state.wasExpectedClose
+}
+
+def readBootstrap()
+{
+    try
+    {
+        def resp = httpExecWithAuthCheck("GET", genParamsMain(getBootstrapSuffix()), true)
+        
+        def subBootstrap
+        if(resp)
+        {
+            //logDebug("FULL BOOTSTRAP FOLLOWS:")
+            //logDebug(resp.data)
+            
+            subBootstrap = scrubBootstrap(resp.data)
+            setBootstrap(subBootstrap)
+        }
+        
+        sendEvent(name: "commStatus", value: "good")
+        
+        return subBootstrap
+    }
+    catch (Exception e)
+    {
+        logDebug("readBootstrap() failed: ${e.message}")
+        sendEvent(name: "commStatus", value: "error")
+        
+        throw(e)
+    }
+}
+
+def scrubBootstrap(bootstrap)
+{
+    if(!bootstrap) { return }
+    
+    // these are the keys we need for every device
+    def baseWhitelist = ['id', 'marketName', 'modelKey', 'name', 'type']
+    
+    def camerasKeysWhitelist = baseWhitelist + ['chimeDuration', 'featureFlags', 'isDark', 'isMotionDetected',
+                                                'isSmartDetected', 'lcdMessage', 'ledSettings', 'smartDetectTypes']
+    def subCameras = bootstrap.cameras?.collect { it.subMap(camerasKeysWhitelist) + [typeName: "motion"] }
+    
+    def lightsKeysWhitelist = baseWhitelist + ['isDark', 'isLightOn', 'isMotionDetected', 'lightDeviceSettings']
+    def subLights = bootstrap.lights?.collect { it.subMap(lightsKeysWhitelist) + [typeName: "light"] }
+    
+    def chimesKeysWhitelist = baseWhitelist + ['cameraIds', 'volume']
+    def subChimes = bootstrap.chimes?.collect { it.subMap(chimesKeysWhitelist) + [typeName: "chime"] }
+    
+    def viewersKeysWhitelist = baseWhitelist + ['liveview']
+    def subViewers = bootstrap.viewers?.collect { it.subMap(viewersKeysWhitelist) + [typeName: "viewer"] }
+    
+    def viewsKeysWhitelist = baseWhitelist
+    def subLiveviews = bootstrap.liveviews?.collect { it.subMap(viewsKeysWhitelist) + [typeName: "liveview"] }
+    
+    // only save the parts that we actually use
+    def subBootstrap = 
+        [cameras: subCameras, lights: subLights, chimes: subChimes,
+         viewers: subViewers, liveviews: subLiveviews, lastUpdateId: bootstrap.lastUpdateId]
+    
+    return subBootstrap
+}
+
+def setBootstrap(bootstrap)
+{
+    state.bootstrap = bootstrap
+}
+
+def getBootstrap()
+{
+    return state.bootstrap
+}
+
+def httpExec(operation, params)
+{
+    def result = null
+    
+    //logDebug("httpExec(${operation}, ${params})")
+    
+    def httpClosure = 
+    { resp ->
+        result = resp
+        //logDebug("result.data = ${result.data}")
+    }
+    
+    def httpOp
+    
+    switch(operation)
+    {
+        case "PATCH":
+            httpOp = this.delegate.&httpPatch
+            break
+        case "POST":
+            httpOp = this.delegate.&httpPost
+            break
+        case "GET":
+            httpOp = this.delegate.&httpGet
+            break
+    }
+    
+    httpOp(params, httpClosure)
+    return result
+}
+
+def httpExecWithAuthCheck(operation, params, throwToCaller = false)
+{
+    def res
+    try
+    {
+        res = httpExec(operation, params)                
+        return res
+    }
+    catch (Exception e)
+    {
+        if(e.getResponse().getStatus().toInteger() == 401)
+        {
+            // 401 Unauthorized
+            try
+            {
+                logDebug("httpExecWithAuthCheck() auth failed.  retrying...")
+                refreshCookie()                
+                
+                // update with new Auth token
+                params['headers']['Cookie'] = getCookie()
+                params['headers']['X-CSRF-Token'] = getCsrf()
+                
+                // workaround for bug?
+                if(null == params['ignoreSSLIssues'])
+                {
+                    params['ignoreSSLIssues']= true
+                }
+                
+                res = httpExec(operation, params)
+                return res
+            }
+            catch (Exception e2)
+            {
+                logDebug("httpExecWithAuthCheck() failed: ${e2.message}")
+                if(throwToCaller)
+                {
+                    throw(e2)
+                }
+            }
+        }
+        else if(e.getResponse().getStatus().toInteger() == 403)
+        {
+            log.error "Operation failed.  Check account permissions.  (${params?.body})"
+        }
+        else
+        {
+            if(throwToCaller)
+            {
+                throw(e)
+            }
+        }
+    }
+}
+
+
+//
+// UniFi Protect packet handling and manipulation code
+//
+
+private subBytes(arr, start, length)
+{
+    return arr.toList().subList(start, start + length) as byte[]
+}
+
+private repackHeaderAsMap(header)
+{
+    def headerMap =
+        [
+            packetType: subBytes(header, 0, 1),
+            payloadFormat: subBytes(header, 1, 1),
+            deflated: subBytes(header, 2, 1),
+            payloadSize: hubitat.helper.HexUtils.hexStringToInt(hubitat.helper.HexUtils.byteArrayToHexString(subBytes(header, 4, 4)))
+        ]
+}
+
+import groovy.transform.Field
+
+def encHexMacro(string) { return string.getBytes()?.encodeHex()?.toString() }
+
+@Field String actionAdd        = encHexMacro('"action":"add"')
+@Field String actionUpdate     = encHexMacro('"action":"update"')
+@Field String modelKeyCamera   = encHexMacro('"modelKey":"camera"')
+@Field String modelKeyChime    = encHexMacro('"modelKey":"chime"')
+@Field String modelKeyEvent    = encHexMacro('"modelKey":"event"')
+@Field String modelKeyLight    = encHexMacro('"modelKey":"light"')
+@Field String modelKeyViewer   = encHexMacro('"modelKey":"viewer"')
+
+@Field String eventValueRing            = encHexMacro('"ring"')
+@Field String isDarkKey                 = encHexMacro('"isDark"')
+@Field String isLightOnKey              = encHexMacro('"isLightOn"')
+@Field String isMotionDetectedKey       = encHexMacro('"isMotionDetected"')
+@Field String isSmartDetectedKey        = encHexMacro('"isSmartDetected"')
+@Field String lcdMessageKey             = encHexMacro('"lcdMessage"')
+@Field String ledSettingsKey            = encHexMacro('"ledSettings"')
+@Field String lightDeviceSettingsKey    = encHexMacro('"lightDeviceSettings"')
+@Field String liveviewKey               = encHexMacro('"liveview"')
+@Field String smartDetectTypesKey       = encHexMacro('"smartDetectTypes"')
+@Field String volumeKey                 = encHexMacro('"volume"')
+
+def coarsePacketValidate(hexString)
+{
+    // Beware: this is coarse and potentially brittle.  Check here first if you are not seeing packets that you think you should!
+    
+    // Before doing any other processing, try to determine if this packet contains useful updates.
+    // This is to limit the processing utilization on Hubitat since the Protect controller is so chatty.    
+    
+    def localStr = hexString?.toLowerCase()
+    if(!localStr) { return null }
+    
+    def searchList
+    
+    if( localStr.contains(modelKeyEvent) && localStr.contains(actionAdd) )
+    {
+        // "event" and "add"
+        searchList = [smartDetectTypesKey, eventValueRing]
+    }
+    
+    if( localStr.contains(modelKeyCamera) && localStr.contains(actionUpdate) )
+    {
+        // "camera" and "update"
+        searchList = [isDarkKey, isMotionDetectedKey, isSmartDetectedKey, lcdMessageKey, ledSettingsKey]
+    }
+    
+    if( localStr.contains(modelKeyChime) && localStr.contains(actionUpdate) )
+    {
+        // "chime" and "update"
+        searchList = [volumeKey]
+    }
+    
+    if( localStr.contains(modelKeyLight) && localStr.contains(actionUpdate) )
+    {
+        // "light" and "update"
+        searchList = [isDarkKey, isLightOnKey, isMotionDetectedKey, lightDeviceSettingsKey]
+    }
+    
+    if( localStr.contains(modelKeyViewer) && localStr.contains(actionUpdate) )
+    {
+        // "liveview" and "update"
+        searchList = [liveviewKey]
+    }
+    
+    return searchList?.any { localStr.contains(it) }
+}
+
+private packetValidateAndDecode(hexString)
+{
+    if(!disablePreFiltering)
+    {
+        if(!coarsePacketValidate(hexString))
+        {
+            //logDebug("dropped packet: ${new String(hubitat.helper.HexUtils.hexStringToByteArray(hexString))}")
+            return
+        }
+    }
+    
+    // all of this is based on the packet formats described here:  https://github.com/hjdhjd/unifi-protect/blob/main/src/protect-api-updates.ts
+    def actionHeader
+    def actionLength
+    def dataHeader
+    def dataLength
+    
+    def bytes
+    
+    //
+    // first, basic packet validation
+    //
+    
+    try
+    {
+        //logDebug("incoming message = ${hexString}")
+        bytes = hubitat.helper.HexUtils.hexStringToByteArray(hexString)
+        
+        actionHeader = subBytes(bytes, 0, 8)
+        actionLength = hubitat.helper.HexUtils.hexStringToInt(hubitat.helper.HexUtils.byteArrayToHexString(subBytes(actionHeader, 4, 4)))
+        dataHeader = subBytes(bytes, actionHeader.size() + actionLength, 8)
+        dataLength = hubitat.helper.HexUtils.hexStringToInt(hubitat.helper.HexUtils.byteArrayToHexString(subBytes(dataHeader, 4, 4)))
+        
+        def totalLength = actionHeader.size() + actionLength + dataHeader.size() + dataLength
+        //logDebug("totalLength = ${totalLength}")
+        //logDebug("bytes.size() = ${bytes.size()}")
+        
+        if(totalLength != bytes.size())
+        {
+            throw new Exception("Header/Packet mismatch.")
+        }
+    }
+    catch (Exception e)
+    {
+        logDebug("packet validation failed: ${e.message}")
+        // any error interpreted as fail
+        return null
+    }
+    
+    //
+    // then, decode and re-pack data
+    //
+    
+    try
+    {
+        def actionHeaderMap = repackHeaderAsMap(actionHeader)
+        def dataHeaderMap = repackHeaderAsMap(dataHeader)
+        
+        def actionPacket = hubitat.helper.HexUtils.byteArrayToHexString(subBytes(bytes, actionHeader.size(), actionHeaderMap.payloadSize))  
+        def dataPacket = hubitat.helper.HexUtils.byteArrayToHexString(subBytes(bytes, actionHeader.size() + actionLength + dataHeader.size(), dataHeaderMap.payloadSize))
+        
+        def slurper = new groovy.json.JsonSlurper()
+        
+        //logDebug("actionHeaderMap = ${actionHeaderMap}")
+        //logDebug("actionPacket = ${actionPacket}")
+
+        def actionJson = actionHeaderMap.deflated?.getAt(0) ? decompress(actionPacket) : makeString(actionPacket)
+        def actionJsonMap = slurper.parseText(actionJson?.toString())
+        
+        def dataJson = dataHeaderMap.deflated?.getAt(0) ? decompress(dataPacket) : makeString(dataPacket)
+        def dataJsonMap = slurper.parseText(dataJson?.toString())
+        
+        def decodedPacket =
+            [
+                actionPacket: [actionHeader: actionHeaderMap, actionPayload: actionJsonMap],
+                dataPacket: [dataHeader: dataHeaderMap, dataPayload: dataJsonMap]
+            ]
+        
+        //logDebug("decodedPacket = ${decodedPacket}")        
+        return decodedPacket
+    }
+    catch (Exception e)
+    {
+        logDebug("packet decoding failed: ${e.message}")
+        // any error interpreted as fail
+        return null
+    }
+}
+
+private makeString(s)
+{
+    return new String(hubitat.helper.HexUtils.hexStringToByteArray(s))
+}
+
+import java.io.ByteArrayOutputStream
+import java.util.zip.Inflater
+
+private decompress(s)
+{
+    // based on this example: https://dzone.com/articles/how-compress-and-uncompress    
+    def sBytes = hubitat.helper.HexUtils.hexStringToByteArray(s)
+    
+    Inflater inflater = new Inflater() 
+    inflater.setInput(sBytes)
+    
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream(sBytes.length)
+    
+    byte[] buffer = new byte[1024]
+    
+    while(!inflater.finished())
+    {  
+        int count = inflater.inflate(buffer)
+        outputStream.write(buffer, 0, count)
+    }
+    
+    outputStream.close()
+    
+    def resp = new String(outputStream.toByteArray())    
+    //logDebug("decompress resp = ${resp}")
+    
+    return resp
+}
